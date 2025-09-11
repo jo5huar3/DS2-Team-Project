@@ -45,7 +45,7 @@ def plot_timeseries_separate(t, X, dt):
         plt.ylabel(lab[0])
         plt.grid(True)
         plt.show()
-
+# Function
 def plot_histograms_separate(X, dt, burn_in_time=5.0):
     burn_in = int(burn_in_time / dt)
     X_ss = X[burn_in:]
@@ -112,5 +112,5 @@ if __name__ == "__main__":
     # ---- Subplots (compact 1×3 layouts) ----
     plot_timeseries_subplots(t, X, dt)
     plot_histograms_subplots(X, dt, burn_in_time=burn_in_time)
-    
+
     print(os.path.abspath("lorenz63_dt001_T50.csv"))
