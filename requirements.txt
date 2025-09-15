@@ -1,0 +1,23 @@
+# Core scientific stack
+numpy
+scipy
+pandas
+
+# Machine learning
+scikit-learn
+tensorflow
+#tensorflow-macos
+#tensorflow-metal
+skorch
+
+# Visualization
+matplotlib
+seaborn
+torch
+torchvision
+
+# Jupyter environment
+jupyterlab
+ipykernel
+jupyter
+nbconvert
