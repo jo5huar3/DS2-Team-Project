@@ -167,3 +167,33 @@ class ESNRegressor(nn.Module):
             outs.append(y.unsqueeze(1))
             x_prev = y                           # feed prediction back in
         return torch.cat(outs, dim=1)
+
+def standardize_sequences(X_train, X_test, y_train, y_test):
+    """
+    Standardize features per-variable using only training statistics.
+    Works by reshaping sequences to 2D, fitting scalers, and reshaping back.
+    """
+    Ntr, L, F = X_train.shape
+    Nte = X_test.shape[0]
+    print(f"""\
+        Ntr: {Ntr}\n\
+        L: {L}\n\
+        F: {F}""") 
+
+    x_scaler = StandardScaler()
+    y_scaler = StandardScaler()
+
+    Xtr2 = X_train.reshape(-1, F)
+    Xte2 = X_test.reshape(-1, F)
+    #print(Xtr2.shape)
+    Xtr2 = x_scaler.fit_transform(Xtr2)
+    Xte2 = x_scaler.transform(Xte2)
+
+    ytr2 = y_scaler.fit_transform(y_train)
+    yte2 = y_scaler.transform(y_test)
+
+    X_train_std = Xtr2.reshape(Ntr, L, F).astype(np.float32)
+    X_test_std  = Xte2.reshape(Nte, L, F).astype(np.float32)
+    y_train_std = ytr2.astype(np.float32)
+    y_test_std  = yte2.astype(np.float32)
+    return X_train_std, X_test_std, y_train_std, y_test_std, x_scaler, y_scaler

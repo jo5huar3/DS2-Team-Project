@@ -82,3 +82,19 @@ class LorenzWindowViewDataset(Dataset):
             y    = (y    - self.mean) / self.std
 
         return torch.from_numpy(warm), torch.from_numpy(x), torch.from_numpy(y)
+
+class ToSkorchXY(Dataset):
+    """
+    Wraps a dataset that yields (warm, x, y) into ((warm, x), y)
+    so skorch can pass (warm, x) into module.forward(warm, x).
+    """
+    def __init__(self, base):
+        self.base = base
+    def __len__(self): 
+        return len(self.base)
+    def __getitem__(self, i):
+        warm, x, y = self.base[i]  # warm:(W,D), x:(X,D), y:(X,D)
+        window = torch.cat([warm, x], dim=0)  # (W+X, D)
+        target = y[-1]                        # (D,)
+        return window, target
+    
