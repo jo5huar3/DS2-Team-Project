@@ -36,6 +36,7 @@ class ESNRegressor(nn.Module):
         self.input_scale = input_scale
         self.bias_scale = bias_scale
         self.sparsity = sparsity
+        self.activation = activation
         self.seed = seed
 
         if activation == 'tanh':
@@ -72,55 +73,81 @@ class ESNRegressor(nn.Module):
             if max_ev == 0.0:
                 max_ev = 1.0
             W = (W * (self.spectral_radius / max_ev)).to(dtype=torch.float32)
-
         self.register_buffer('W_in', W_in)
         self.register_buffer('W', W)
         self.register_buffer('b', b)
 
-
         # Trainable linear readout
         self.Wout = nn.Linear(self.reservoir_size, self.output_size, bias=True)
 
-    def forward(self, X):
-        """
-        X: (batch, seq_len, input_size=3)
-        returns: (batch, output_size=3) for the last step
-        """
-        B, L, F = X.shape
-        assert F == self.input_size
+        # ---- Persistent (stateful) reservoir memory ----
+        # Created lazily in reset_state / first run; kept across calls if you want.
+        self._state_r: torch.Tensor | None = None  # shape (B, N)
+        self.saved_r: torch.Tensor | None = None   # last run's final state (detached)
 
-        r = X.new_zeros(B, self.reservoir_size)
-        W, W_in, b = self.W, self.W_in, self.b
-        alpha = self.leak
-        act = self.act
+    @torch.no_grad()
+    def reset_state(self, batch_size: int = 1, device: torch.device | None = None):
+        if device is None:
+            device = self.W.device
+        self._state_r = torch.zeros(batch_size, self.reservoir_size, device=device, dtype=torch.float32)
+        self.saved_r = self._state_r.clone().detach()
 
-        for t in range(L):
-            x_t = X[:, t, :]  # (B, F)
-            drive = x_t @ W_in.t() + r @ W.t() + b   # (B, N_res)
-            r = (1 - alpha) * r + alpha * act(drive)
+    def get_state(self) -> torch.Tensor:
+        if getattr(self, "_state_r", None) is None:
+            self.reset_state(batch_size=1, device=self.W.device)
+        return self._state_r
 
-        y_hat = self.Wout(r)
-        return y_hat
+    @torch.no_grad()
+    def set_state(self, r: torch.Tensor):
+        assert r.dim() == 2 and r.size(1) == self.reservoir_size
+        self._state_r = r.to(self.W.device, dtype=torch.float32)
+        self.saved_r = self._state_r.clone().detach()
 
-    def forward_step(self, r, u):
-        """
-        Single step update of reservoir state.
-        r: (B, N) reservoir state
-        u: (B, F) input
-        returns: (B, N) updated reservoir state
-        """
-        drive = u @ self.W_in.t() + r @ self.W.t() + self.b  # (B, N)
+    # ----- core update -----
+    def forward_step(self, r: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        drive = u @ self.W_in.t() + r @ self.W.t() + self.b
         r_new = (1 - self.leak) * r + self.leak * self.act(drive)
         return r_new
+
+    # ----- accept (B,F) or (B,L,F) -----
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        If X is (B, F): treat as single-step update (linear run / online).
+        If X is (B, L, F): iterate over L steps and return the last-step output.
+        """
+        if X.dim() == 2:
+            # Single step: keep/persist internal state
+            B, F = X.shape
+            assert F == self.input_size
+            # ensure state batch matches B
+            r = self.get_state()
+            if r.size(0) != B or r.device != X.device:
+                r = X.new_zeros(B, self.reservoir_size)
+            r = self.forward_step(r, X)
+            self.saved_r = r.detach().clone()
+            self._state_r = r
+            return self.Wout(r)
+
+        elif X.dim() == 3:
+            B, L, F = X.shape
+            assert F == self.input_size
+            r = X.new_zeros(B, self.reservoir_size)
+            for t in range(L):
+                r = self.forward_step(r, X[:, t, :])
+            self.saved_r = r.detach().clone()
+            return self.Wout(r)
+
+        else:
+            raise ValueError("X must have shape (B,F) or (B,L,F)")
     
     @torch.no_grad()
     def warmup(self, U):
         """
-        Teacher-forcing warmup to initialize the reservoir state.
-        U: (B, L0, input_size) or (L0, input_size) or numpy
+        Teacher-forcing warmup to initialize the reservoir.
+        U: (B, L0, F) or (L0, F) or numpy
         Returns:
-            r: (B, reservoir_size) final warmup state
-            last_in: (B, input_size) last warmup input
+            r: (B, N) final warmup state
+            last_in: (B, F) last warmup input
         """
         U = torch.as_tensor(U, dtype=torch.float32, device=self.W.device)
         if U.dim() == 2:
@@ -132,24 +159,11 @@ class ESNRegressor(nn.Module):
         r = torch.zeros(B, self.reservoir_size, dtype=U.dtype, device=U.device)
         for t in range(L0):
             r = self.forward_step(r, U[:, t, :])
-        return r, U[:, -1, :]
 
-    def forward_seq(self, warm: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        """
-        Teacher-forced sequence prediction.
-        warm: (B, W, F)   -- primes the reservoir
-        x:    (B, X, F)   -- inputs where each step predicts next-step y
-        returns y_hat: (B, X, F)
-        """
-        # Warm up the reservoir with teacher forcing
-        r, _last_in = self.warmup(warm)          # r: (B, N)
-        B, X, F = x.shape
-        outs = []
-        for t in range(X):
-            r = self.forward_step(r, x[:, t, :]) # update reservoir with x_t
-            y_t = self.Wout(r)                   # predict next step
-            outs.append(y_t.unsqueeze(1))
-        return torch.cat(outs, dim=1)            # (B, X, F)
+        # keep + expose
+        self._state_r = r.detach().clone()
+        self.saved_r = self._state_r.clone().detach()
+        return r, U[:, -1, :]
 
     @torch.no_grad()
     def rollout(self, warm: torch.Tensor, steps: int) -> torch.Tensor:
@@ -166,6 +180,33 @@ class ESNRegressor(nn.Module):
             y = self.Wout(r)
             outs.append(y.unsqueeze(1))
             x_prev = y                           # feed prediction back in
+        self.saved_r = r.detach().clone()
+        self._state_r = r.detach().clone()
+        return torch.cat(outs, dim=1)
+    
+    @torch.no_grad()
+    def linear_run(self, U, reset: bool = True, save_state: bool = True) -> torch.Tensor:
+        """
+        Process U in order with internal state. U: (L,F) or (B,L,F).
+        Returns per-step predictions (B,L,output_size).
+        """
+        U = torch.as_tensor(U, dtype=torch.float32, device=self.W.device)
+        if U.dim() == 2:
+            U = U.unsqueeze(0)
+        B, L, F = U.shape
+        assert F == self.input_size
+
+        if reset or getattr(self, "_state_r", None) is None or self._state_r.size(0) != B:
+            self.reset_state(B, device=U.device)
+
+        r = self._state_r
+        outs = []
+        for t in range(L):
+            r = self.forward_step(r, U[:, t, :])
+            outs.append(self.Wout(r).unsqueeze(1))
+        self._state_r = r
+        if save_state:
+            self.saved_r = r.detach().clone()
         return torch.cat(outs, dim=1)
 
 def standardize_sequences(X_train, X_test, y_train, y_test):

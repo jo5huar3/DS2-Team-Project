@@ -1,18 +1,20 @@
+#Best params: {'max_epochs': 12, 'module__input_scale': 0.6, 'module__leak': 0.9, 'module__reservoir_size': 300, 'module__sparsity': 0.03, 'module__spectral_radius': 1.0, 'optimizer__lr': 0.002}
 # esn_lorenz63_skorch_grid.py
-import math, time, os
+import time
 import numpy as np
 import torch
 import torch.nn as nn
+
 from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
-from sklearn.metrics import mean_squared_error
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 from skorch import NeuralNetRegressor
-from time_series.data_util import lorenz63_rhs, rk4_step, simulate_lorenz63
+from time_series.data_util import *
+
 
 
 # ----------------------------------------
-# ESN Module: fixed reservoir + readout
+# 3) ESN Module: fixed reservoir + readout
 # ----------------------------------------
 class ESNRegressor(nn.Module):
     def __init__(self,
@@ -101,7 +103,7 @@ class ESNRegressor(nn.Module):
         return y_hat
 
 # -----------------------------
-# k-step free-run evaluation
+# 4) k-step free-run evaluation
 # -----------------------------
 @torch.no_grad()
 def rollout_free_run(model_or_search, x0_seq_orig, k, x_scaler, y_scaler):
@@ -133,62 +135,13 @@ def rollout_free_run(model_or_search, x0_seq_orig, k, x_scaler, y_scaler):
 
     return np.stack(preds, axis=0)  # (k, 3)
 
+def per_dim_rmse(y_true, y_pred, eps=1e-12):
+    mse = np.mean((y_true - y_pred) ** 2, axis=0)
+    return np.sqrt(np.maximum(mse, 0.0) + eps)
 
-# ------------------------------------
-# Sliding-window dataset utilities
-# ------------------------------------
-def make_sliding_windows(data, seq_len=20, horizon=1, washout=200):
-    """
-    data: (T, 3) Lorenz63 states
-    seq_len: input window length (teacher-forced)
-    horizon: predict t+1 ... t+horizon (here we use 1 for next-step)
-    washout: drop initial transient
-    Returns:
-      X: (N, seq_len, 3)
-      y: (N, 3)  # next-step target
-    """
-    D = data.astype(np.float32)
-    D = D[washout:]  # drop transients
-    T = len(D)
-    X_list, y_list = [], []
-    for t in range(T - seq_len - horizon + 1):
-        X_list.append(D[t:t+seq_len, :])
-        y_list.append(D[t+seq_len + horizon - 1, :])  # next-step for horizon=1
-    X = np.stack(X_list, axis=0)
-    y = np.stack(y_list, axis=0)
-    return X, y  # (N, L, 3), (N, 3)
-
-def standardize_sequences(X_train, X_test, y_train, y_test):
-    """
-    Standardize features per-variable using only training statistics.
-    Works by reshaping sequences to 2D, fitting scalers, and reshaping back.
-    """
-    Ntr, L, F = X_train.shape
-    Nte = X_test.shape[0]
-    print(f"""\
-        Ntr: {Ntr}\n\
-        L: {L}\n\
-        F: {F}""") 
-
-    x_scaler = StandardScaler()
-    y_scaler = StandardScaler()
-
-    Xtr2 = X_train.reshape(-1, F)
-    Xte2 = X_test.reshape(-1, F)
-    #print(Xtr2.shape)
-    Xtr2 = x_scaler.fit_transform(Xtr2)
-    Xte2 = x_scaler.transform(Xte2)
-
-    ytr2 = y_scaler.fit_transform(y_train)
-    yte2 = y_scaler.transform(y_test)
-
-    X_train_std = Xtr2.reshape(Ntr, L, F).astype(np.float32)
-    X_test_std  = Xte2.reshape(Nte, L, F).astype(np.float32)
-    y_train_std = ytr2.astype(np.float32)
-    y_test_std  = yte2.astype(np.float32)
-    return X_train_std, X_test_std, y_train_std, y_test_std, x_scaler, y_scaler
-
-
+# ---------------
+# 5) Main routine
+# ---------------
 if __name__ == "__main__":
     rng = np.random.default_rng(0)
     device = torch.accelerator.current_accelerator().type if torch.accelerator.is_available() else "cpu"
@@ -212,98 +165,86 @@ if __name__ == "__main__":
     X_train_std, X_test_std, y_train_std, y_test_std, x_scaler, y_scaler = standardize_sequences(
         X_train, X_test, y_train, y_test
     )
+# Best params: {'max_epochs': 12, 'module__input_scale': 0.6, 'module__leak': 0.9, 'module__reservoir_size': 300, 'module__sparsity': 0.03, 'module__spectral_radius': 1.0, 'optimizer__lr': 0.002}
+    best_params = {
+        "reservoir_size": 300,
+        "leak": 0.9,
+        "spectral_radius": 1.0,
+        "input_scale": 0.6,
+        "sparsity": 0.03,
+        "bias_scale": 0.0,         # unchanged
+        "activation": "tanh",
+        "seed": 42,
+    }
 
-    # skorch wrapper (no inner validation split; CV handles it)
     net = NeuralNetRegressor(
         ESNRegressor,
         module__input_size=3,
         module__output_size=3,
+        module__reservoir_size=best_params["reservoir_size"],
+        module__leak=best_params["leak"],
+        module__spectral_radius=best_params["spectral_radius"],
+        module__input_scale=best_params["input_scale"],
+        module__sparsity=best_params["sparsity"],
+        module__bias_scale=best_params["bias_scale"],
+        module__activation=best_params["activation"],
+        module__seed=best_params["seed"],
         criterion=nn.MSELoss,
         optimizer=torch.optim.Adam,
-        optimizer__lr=2e-3,
-        max_epochs=30,
-        batch_size=256,
-        train_split=None,
+        optimizer__lr=2e-3,        # from your best config
+        max_epochs=12,             # from your best config
+        batch_size=1024,           # large batch for speed
+        train_split=None,          # no internal val split
         device=device,
         iterator_train__shuffle=False,
     )
-    net.set_params(verbose=0)
-    # Parameter grid: tune ESN dynamics + size
-    param_grid = {
-        'module__reservoir_size': [300, 500, 700, 1000],       # was [400, 800]
-        'module__leak': [0.6, 0.9],                 # trim
-        'module__spectral_radius': [0.85, 1.0],     # trim
-        'module__input_scale': [0.6, 1.0],          # trim
-        'module__sparsity': [0.03],                 # single value for speed
-        'optimizer__lr': [2e-3],                    # single value for speed
-        'max_epochs': [12],                         # was [25, 40]
-    }
-    '''
-    param_grid = {
-    # reservoir dynamics
-    'module__reservoir_size': [300, 500, 700],           # capacity 3
-    'module__leak': [0.5, 0.7, 0.9, 1.0],                # integration speed 4
-    'module__spectral_radius': [0.7, 0.85, 1.0, 1.1],    # memory/ESP 4
-    'module__input_scale': [0.4, 0.6, 0.9, 1.2],         # drive strength 4
-    'module__sparsity': [0.02, 0.03, 0.05],              # connectivity 3
-    'module__bias_scale': [0.0, 0.1, 0.2],               # bias drive 3
-    'module__activation': ['tanh', 'relu'],              # nonlinearity 2
 
-    # optimization/regularization for readout (Adam)
-    'optimizer__lr': [1e-3, 2e-3, 3e-3],                 # 3
-    'optimizer__weight_decay': [0.0, 1e-4, 1e-3],        # L2 ~ ridge 3
-    'batch_size': [256, 512, 1024],                      # 3
-    'max_epochs': [12, 25],                              # 2
+    # --------------------
+    # 3) Train the model
+    # --------------------
+    t0 = time.time()
+    net.fit(X_train_std, y_train_std)
+    train_secs = time.time() - t0
+    print(f"Fit time: {train_secs:.2f}s")
 
-    # robustness to random reservoir draws
-    'module__seed': [42, 123, 314],
-    }'''
-    cv = TimeSeriesSplit(n_splits=3)
-    
-    gs = GridSearchCV(
-        net,
-        param_grid=param_grid,
-        scoring='neg_mean_squared_error',  # on standardized targets
-        cv=2,
-        refit=True,
-        n_jobs=-1,
-        verbose=0,
-    )
-
-    gs = RandomizedSearchCV(net, param_distributions=param_grid, n_iter=100,
-                                cv=cv, scoring='neg_mean_squared_error',
-                                n_jobs=-1, verbose=0, random_state=0)
-
-    start_time = time.time()
-    # Fit on standardized data
-    gs.fit(X_train_std, y_train_std)
-
-    print("Best params:", gs.best_params_)
-    print("Best CV MSE (std space):", -gs.best_score_)
-
-    # One-step test evaluation
-    y_pred_std = gs.predict(X_test_std).astype(np.float32)
+    # ----------------------
+    # 4) One-step evaluation
+    # ----------------------
+    y_pred_std = net.predict(X_test_std).astype(np.float32)
     y_pred = y_scaler.inverse_transform(y_pred_std)
-    test_mse = mean_squared_error(y_test, y_pred)
-    print("One-step Test MSE (original scale):", test_mse)
 
-  # Choose starting window
-    x0_seq = X_test[0]  # (SEQ_LEN, 3) in ORIGINAL scale
+    mse = mean_squared_error(y_test, y_pred)
+    mae = mean_absolute_error(y_test, y_pred)
+    r2 = r2_score(y_test, y_pred)
+    rmse_dim = per_dim_rmse(y_test, y_pred)
+    rmse_overall = float(np.sqrt(mse))
 
-    K = 10  # steps to forecast
-    preds = rollout_free_run(gs, x0_seq, K, x_scaler, y_scaler)
+    print("\n=== One-step metrics (original scale) ===")
+    print(f"MSE:  {mse:.6f}")
+    print(f"RMSE: {rmse_overall:.6f}")
+    print(f"MAE:  {mae:.6f}")
+    print(f"R^2:  {r2:.6f}")
+    print(f"Per-dim RMSE [x, y, z]: {rmse_dim}")
 
-    # Build ground truth for comparison.
-    # let train_windows = number of training windows (i.e., len(X_train))
+    # -----------------------------------------------
+    # 5) k-step free-run rollout and its test MSE
+    # -----------------------------------------------
+    K = 50  # steps to forecast closed-loop
+    x0_seq = X_test[0]  # ORIGINAL scale starting window
+
+    preds = rollout_free_run(net, x0_seq, K, x_scaler, y_scaler)
+
+    # Build ground truth aligned with the chosen window
+    # If X_test[0] corresponds to data indices [t0 : t0+SEQ_LEN-1],
+    # the first “next” state (target) is at data[t0+SEQ_LEN].
     train_windows = X_train.shape[0]
-    SEQ_LEN = X_test.shape[1]  # or your constant
-    WASHOUT = WASHOUT          # keep your constant
-    # In make_sliding_windows, the window starting at index t uses data[t : t+SEQ_LEN]
-    # and the first predicted "next" state is at data[t+SEQ_LEN].
-    t0_global = WASHOUT + train_windows  # this is where X_test[0] begins
-    gt_start = t0_global + SEQ_LEN       # first next-step after the window
-    gt = data[gt_start : gt_start + K]   # (K, 3) in original scale
+    t0_global = WASHOUT + train_windows       # where X_test[0] starts in 'data'
+    gt_start = t0_global + SEQ_LEN            # first next-step after the window
+    gt = data[gt_start : gt_start + K]        # shape (K, 3)
 
-    from sklearn.metrics import mean_squared_error
     rollout_mse = mean_squared_error(gt, preds)
-    print(f"{K}-step Free-run MSE (original scale): {rollout_mse:.6f}")
+    rollout_rmse = float(np.sqrt(rollout_mse))
+    print("\n=== Closed-loop rollout metrics (original scale) ===")
+    print(f"{K}-step MSE:  {rollout_mse:.6f}")
+    print(f"{K}-step RMSE: {rollout_rmse:.6f}")
+

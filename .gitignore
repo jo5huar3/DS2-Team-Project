@@ -1,3 +1,21 @@
-*__pycache__
-local
-lorenz63_dt001_T50.csv
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Environment and secrets
+.env
+.venv/
+
+# OS files
+.DS_Store
+
+# Large or generated data (the 4.5 GB Lorenz-63 series is regenerated locally)
+data/
+*.npz
+*.pkl
+
+# Local-only material: presentation videos, course admin files, scratch copies
+archive/
+experiments/20*/
+esn_grid_*/

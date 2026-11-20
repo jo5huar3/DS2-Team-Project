@@ -1,39 +1,110 @@
-import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
 from scipy.signal import welch, resample_poly
 from scipy.spatial.distance import jensenshannon
+import numpy as np
+import pandas as pd
 
-# ---------- helpers (from your snippet) ----------
-def psd_energy_below(fs, x, f_cut):
-    f, Pxx = welch(x, fs=fs, nperseg=min(len(x)//8, 2048))
-    mask = f <= f_cut
-    ce = np.trapz(Pxx[mask], f[mask]) / np.trapz(Pxx, f)
-    return ce, (f, Pxx)
+# ---------- helpers (robust & band-limited) ----------
+def psd_energy_below(fs, x, f_cut, nperseg=None):
+    """
+    Fraction of PSD energy below f_cut using Welch. Robust defaults for nperseg.
+    Returns (fraction_in_band, (freqs, PSD)).
+    """
+    x = np.asarray(x, float)
+    n = len(x)
+    if nperseg is None:
+        # keep segments not too short and not too long
+        nperseg = min(2048, max(256, n // 8))
+    nperseg = min(nperseg, n)
 
-def jsd_psd(f1, P1, f2, P2):
-    f = np.linspace(max(f1.min(), f2.min()), min(f1.max(), f2.max()), 2048)
-    P1i = np.interp(f, f1, P1)
-    P2i = np.interp(f, f2, P2)
-    P1i = P1i / (P1i.sum() + 1e-12)
-    P2i = P2i / (P2i.sum() + 1e-12)
-    return jensenshannon(P1i, P2i) ** 2  # JSD (distance^2)
+    f, Pxx = welch(
+        x, fs=fs, nperseg=nperseg,
+        detrend="constant", scaling="density", return_onesided=True
+    )
+    Pxx = np.clip(Pxx, 0.0, None)
+    denom = np.trapz(Pxx, f)
+    if denom <= 0:
+        return 0.0, (f, Pxx)
+
+    mask = f <= float(f_cut)
+    num = np.trapz(Pxx[mask], f[mask]) if np.any(mask) else 0.0
+    ce = num / denom
+    return float(ce), (f, Pxx)
+
+
+def jsd_psd(f1, P1, f2, P2, f_max=None, base=2):
+    """
+    Band-limited JSD between normalized PSDs.
+    - Compares only up to f_max (defaults to min Nyquist).
+    - Uses SciPy's Jensen-Shannon *distance* and squares it to get divergence.
+    Returns np.nan if PSD mass in the band is zero for either input.
+    """
+    f1 = np.asarray(f1, float); P1 = np.asarray(P1, float)
+    f2 = np.asarray(f2, float); P2 = np.asarray(P2, float)
+    f_hi = min(f1[-1], f2[-1])
+    if f_max is not None:
+        f_hi = min(f_hi, float(f_max))
+    if f_hi <= 0:
+        return np.nan
+
+    # Common grid in [0, f_hi]
+    m = 2048
+    f = np.linspace(0.0, f_hi, m, endpoint=True)
+
+    # Interpolate and clip negative numerical noise
+    P1i = np.interp(f, f1, P1, left=0.0, right=0.0)
+    P2i = np.interp(f, f2, P2, left=0.0, right=0.0)
+    P1i = np.clip(P1i, 0.0, None)
+    P2i = np.clip(P2i, 0.0, None)
+
+    s1, s2 = P1i.sum(), P2i.sum()
+    if s1 <= 0 or s2 <= 0:
+        return np.nan
+
+    p = P1i / s1
+    q = P2i / s2
+
+    # SciPy returns the distance in [0,1] when base=2; square for divergence
+    return float(jensenshannon(p, q, base=base) ** 2)
+
 
 def resample_to_original(x_stride, s):
-    return resample_poly(x_stride, up=s, down=1)
+    """Upsample by integer stride s using polyphase filtering."""
+    return resample_poly(x_stride, up=int(s), down=1)
+
 
 def time_metrics(x, x_hat):
+    """
+    NRMSE normalized by std(x) and Pearson r. Handles constant-series edge cases.
+    """
     n = min(len(x), len(x_hat))
-    x = x[:n]; x_hat = x_hat[:n]
-    nrmse = np.sqrt(np.mean((x - x_hat) ** 2)) / (x.std() + 1e-9)
-    r = np.corrcoef(x, x_hat)[0, 1]
+    x = np.asarray(x[:n], float)
+    x_hat = np.asarray(x_hat[:n], float)
+
+    sd = x.std()
+    nrmse = 0.0 if sd <= 1e-12 else float(np.sqrt(np.mean((x - x_hat) ** 2)) / sd)
+
+    sx, sy = x.std(), x_hat.std()
+    if sx <= 1e-12 and sy <= 1e-12:
+        r = 1.0  # both constant and equal up to shifting
+    elif sx <= 1e-12 or sy <= 1e-12:
+        r = 0.0  # one constant, the other not
+    else:
+        r = float(np.corrcoef(x, x_hat)[0, 1])
     return nrmse, r
 
-def downsample_safe(x, s):
-    return resample_poly(x, up=1, down=s)
 
-# ---------- single-axis analysis ----------
+def downsample_safe(x, s):
+    """Downsample by integer stride s with anti-alias filtering (resample_poly)."""
+    return resample_poly(x, up=1, down=int(s))
+
+
+# ---------- single-axis analysis (uses band-limited JSD) ----------
 def analyze_resampling(x, fs, stride=4, f_cut=None, title_prefix=None, make_plots=False):
+    """
+    Downsample->upsample a single series and report:
+      energy fractions, band-limited JSD(PSD), time NRMSE & corr, plus artifacts.
+    """
+    x = np.asarray(x, float)
     if f_cut is None:
         f_cut = fs / 10.0
 
@@ -41,14 +112,17 @@ def analyze_resampling(x, fs, stride=4, f_cut=None, title_prefix=None, make_plot
     fs_ds = fs / stride
 
     ce_orig, (f1, P1) = psd_energy_below(fs, x, f_cut)
-    ce_ds,   (f2, P2) = psd_energy_below(fs_ds, x_ds, min(f_cut, fs_ds/2))
+    ce_ds,   (f2, P2) = psd_energy_below(fs_ds, x_ds, min(f_cut, fs_ds / 2.0))
 
-    jsd = jsd_psd(f1, P1, f2, P2)
+    # Compare spectra only on common/allowed band
+    f_max = min(f_cut, fs_ds / 2.0)
+    jsd = jsd_psd(f1, P1, f2, P2, f_max=f_max, base=2)
 
     x_up = resample_to_original(x_ds, stride)
     nrmse, r = time_metrics(x, x_up)
 
     if make_plots and title_prefix:
+        import matplotlib.pyplot as plt
         Nplot = min(4000, len(x), len(x_up))
         plt.figure()
         plt.plot(x[:Nplot], label="original")
@@ -59,7 +133,8 @@ def analyze_resampling(x, fs, stride=4, f_cut=None, title_prefix=None, make_plot
         plt.figure()
         plt.semilogy(f1, P1, label="orig PSD")
         plt.semilogy(f2, P2, label=f"down PSD (fs={fs_ds:.2f} Hz)")
-        plt.axvline(f_cut, linestyle="--", label=f"f_cut={f_cut:.2f} Hz")
+        f_cut_eff = min(f_cut, fs_ds / 2.0)
+        plt.axvline(f_cut_eff, linestyle="--", label=f"band limit = {f_cut_eff:.2f} Hz")
         plt.title(f"{title_prefix}: PSD (Welch)")
         plt.xlabel("frequency (Hz)"); plt.ylabel("PSD"); plt.legend(); plt.show()
 
