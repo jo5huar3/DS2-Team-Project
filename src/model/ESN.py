@@ -1,0 +1,240 @@
+# esn_lorenz63_skorch_grid.py
+import math, time, os
+from typing import Optional
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.model_selection import GridSearchCV, train_test_split
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import RandomizedSearchCV, TimeSeriesSplit
+from sklearn.metrics import mean_squared_error
+from skorch import NeuralNetRegressor
+from time_series.data_util import lorenz63_rhs, rk4_step, simulate_lorenz63
+
+
+# ----------------------------------------
+# ESN Module: fixed reservoir + readout
+# ----------------------------------------
+class ESNRegressor(nn.Module):
+    def __init__(self,
+                 input_size=3,
+                 reservoir_size=500,
+                 output_size=3,
+                 leak=0.7,
+                 spectral_radius=0.9,
+                 input_scale=0.8,
+                 bias_scale=0.0,
+                 sparsity=0.05,
+                 activation='tanh',
+                 seed=42):
+        super().__init__()
+        self.input_size = input_size
+        self.reservoir_size = reservoir_size
+        self.output_size = output_size
+        self.leak = leak
+        self.spectral_radius = spectral_radius
+        self.input_scale = input_scale
+        self.bias_scale = bias_scale
+        self.sparsity = sparsity
+        self.activation = activation
+        self.seed = seed
+
+        if activation == 'tanh':
+            self.act = torch.tanh
+        elif activation == 'relu':
+            self.act = torch.relu
+        else:
+            raise ValueError("activation must be 'tanh' or 'relu'")
+
+        
+        g = torch.Generator(device='cpu')
+        g.manual_seed(seed)
+
+        # Input weights (N_res, N_in) in [-1, 1]
+        W_in = (torch.rand((self.reservoir_size, self.input_size), generator=g) * 2.0 - 1.0)
+        W_in *= self.input_scale
+
+        # Bias in [-1, 1]
+        b = (torch.rand((self.reservoir_size,), generator=g) * 2.0 - 1.0) * self.bias_scale
+
+        # Sparse recurrent W (N_res, N_res)
+        W = torch.zeros(self.reservoir_size, self.reservoir_size)
+        nnz = max(1, int(self.sparsity * self.reservoir_size * self.reservoir_size))
+        row_idx = torch.randint(self.reservoir_size, (nnz,), generator=g)
+        col_idx = torch.randint(self.reservoir_size, (nnz,), generator=g)
+        vals = (torch.rand((nnz,), generator=g) * 2.0 - 1.0)
+        W[row_idx, col_idx] = vals
+
+        # Scale to desired spectral radius – compute eigvals on CPU in double
+        with torch.no_grad():
+            W_cpu = W.to(dtype=torch.float64, device='cpu')
+            eigvals = torch.linalg.eigvals(W_cpu).abs().real
+            max_ev = float(torch.max(eigvals)) if torch.any(eigvals > 0) else 1.0
+            if max_ev == 0.0:
+                max_ev = 1.0
+            W = (W * (self.spectral_radius / max_ev)).to(dtype=torch.float32)
+        self.register_buffer('W_in', W_in)
+        self.register_buffer('W', W)
+        self.register_buffer('b', b)
+
+        # Trainable linear readout
+        self.Wout = nn.Linear(self.reservoir_size, self.output_size, bias=True)
+
+        # ---- Persistent (stateful) reservoir memory ----
+        # Created lazily in reset_state / first run; kept across calls if you want.
+        self._state_r: torch.Tensor | None = None  # shape (B, N)
+        self.saved_r: torch.Tensor | None = None   # last run's final state (detached)
+
+    @torch.no_grad()
+    def reset_state(self, batch_size: int = 1, device: torch.device | None = None):
+        if device is None:
+            device = self.W.device
+        self._state_r = torch.zeros(batch_size, self.reservoir_size, device=device, dtype=torch.float32)
+        self.saved_r = self._state_r.clone().detach()
+
+    def get_state(self) -> torch.Tensor:
+        if getattr(self, "_state_r", None) is None:
+            self.reset_state(batch_size=1, device=self.W.device)
+        return self._state_r
+
+    @torch.no_grad()
+    def set_state(self, r: torch.Tensor):
+        assert r.dim() == 2 and r.size(1) == self.reservoir_size
+        self._state_r = r.to(self.W.device, dtype=torch.float32)
+        self.saved_r = self._state_r.clone().detach()
+
+    # ----- core update -----
+    def forward_step(self, r: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        drive = u @ self.W_in.t() + r @ self.W.t() + self.b
+        r_new = (1 - self.leak) * r + self.leak * self.act(drive)
+        return r_new
+
+    # ----- accept (B,F) or (B,L,F) -----
+    def forward(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        If X is (B, F): treat as single-step update (linear run / online).
+        If X is (B, L, F): iterate over L steps and return the last-step output.
+        """
+        if X.dim() == 2:
+            # Single step: keep/persist internal state
+            B, F = X.shape
+            assert F == self.input_size
+            # ensure state batch matches B
+            r = self.get_state()
+            if r.size(0) != B or r.device != X.device:
+                r = X.new_zeros(B, self.reservoir_size)
+            r = self.forward_step(r, X)
+            self.saved_r = r.detach().clone()
+            self._state_r = r
+            return self.Wout(r)
+
+        elif X.dim() == 3:
+            B, L, F = X.shape
+            assert F == self.input_size
+            r = X.new_zeros(B, self.reservoir_size)
+            for t in range(L):
+                r = self.forward_step(r, X[:, t, :])
+            self.saved_r = r.detach().clone()
+            return self.Wout(r)
+
+        else:
+            raise ValueError("X must have shape (B,F) or (B,L,F)")
+    
+    @torch.no_grad()
+    def warmup(self, U):
+        """
+        Teacher-forcing warmup to initialize the reservoir.
+        U: (B, L0, F) or (L0, F) or numpy
+        Returns:
+            r: (B, N) final warmup state
+            last_in: (B, F) last warmup input
+        """
+        U = torch.as_tensor(U, dtype=torch.float32, device=self.W.device)
+        if U.dim() == 2:
+            U = U.unsqueeze(0)  # (1, L0, F)
+
+        B, L0, F = U.shape
+        assert F == self.input_size, f"Expected input_size={self.input_size}, got {F}"
+
+        r = torch.zeros(B, self.reservoir_size, dtype=U.dtype, device=U.device)
+        for t in range(L0):
+            r = self.forward_step(r, U[:, t, :])
+
+        # keep + expose
+        self._state_r = r.detach().clone()
+        self.saved_r = self._state_r.clone().detach()
+        return r, U[:, -1, :]
+
+    @torch.no_grad()
+    def rollout(self, warm: torch.Tensor, steps: int) -> torch.Tensor:
+        """
+        Free-run autoregressive rollout after warmup.
+        warm: (B, W, F)
+        returns: (B, steps, F)
+        """
+        r, last_in = self.warmup(warm)           # (B, N), (B, F)
+        x_prev = last_in
+        outs = []
+        for _ in range(steps):
+            r = self.forward_step(r, x_prev)
+            y = self.Wout(r)
+            outs.append(y.unsqueeze(1))
+            x_prev = y                           # feed prediction back in
+        self.saved_r = r.detach().clone()
+        self._state_r = r.detach().clone()
+        return torch.cat(outs, dim=1)
+    
+    @torch.no_grad()
+    def linear_run(self, U, reset: bool = True, save_state: bool = True) -> torch.Tensor:
+        """
+        Process U in order with internal state. U: (L,F) or (B,L,F).
+        Returns per-step predictions (B,L,output_size).
+        """
+        U = torch.as_tensor(U, dtype=torch.float32, device=self.W.device)
+        if U.dim() == 2:
+            U = U.unsqueeze(0)
+        B, L, F = U.shape
+        assert F == self.input_size
+
+        if reset or getattr(self, "_state_r", None) is None or self._state_r.size(0) != B:
+            self.reset_state(B, device=U.device)
+
+        r = self._state_r
+        outs = []
+        for t in range(L):
+            r = self.forward_step(r, U[:, t, :])
+            outs.append(self.Wout(r).unsqueeze(1))
+        self._state_r = r
+        if save_state:
+            self.saved_r = r.detach().clone()
+        return torch.cat(outs, dim=1)
+
+def standardize_sequences(X_train, X_test, y_train, y_test):
+    """
+    Standardize features per-variable using only training statistics.
+    Works by reshaping sequences to 2D, fitting scalers, and reshaping back.
+    """
+    Ntr, L, F = X_train.shape
+    Nte = X_test.shape[0]
+    print(f"""\
+        Ntr: {Ntr}\n\
+        L: {L}\n\
+        F: {F}""") 
+
+    x_scaler = StandardScaler()
+    y_scaler = StandardScaler()
+
+    Xtr2 = X_train.reshape(-1, F)
+    Xte2 = X_test.reshape(-1, F)
+    #print(Xtr2.shape)
+    Xtr2 = x_scaler.fit_transform(Xtr2)
+    Xte2 = x_scaler.transform(Xte2)
+
+    ytr2 = y_scaler.fit_transform(y_train)
+    yte2 = y_scaler.transform(y_test)
+
+    X_train_std = Xtr2.reshape(Ntr, L, F).astype(np.float32)
+    X_test_std  = Xte2.reshape(Nte, L, F).astype(np.float32)
+    y_train_std = ytr2.astype(np.float32)
+    y_test_std  = yte2.astype(np.float32)
+    return X_train_std, X_test_std, y_train_std, y_test_std, x_scaler, y_scaler
